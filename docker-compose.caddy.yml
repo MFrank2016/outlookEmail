@@ -1,0 +1,39 @@
+# 可选叠加文件：将本服务接入宿主机 Caddy 反向代理网络
+#
+# 适用场景：宿主机已有一套 Caddy（如 /opt/caddy）占用 80/443，
+# 并通过共享网络按容器名回源。本文件把 outlook 容器接入该网络，
+# 同时把 5000 端口收紧为仅宿主机本机可访问（公网只走域名 + HTTPS）。
+#
+# 用法：
+#   docker compose -f docker-compose.build.yml -f docker-compose.caddy.yml up -d
+#
+# 宿主机 Caddyfile 对应站点块示例（DNS-01 + Cloudflare，自动签发证书）：
+#   outlook.061995.xyz {
+#       reverse_proxy http://outlook-mail-local:5000 {
+#           header_up Host {host}
+#           header_up X-Real-IP {remote_host}
+#           header_up X-Forwarded-For {remote_host}
+#           header_up X-Forwarded-Proto {scheme}
+#       }
+#       encode zstd gzip
+#       tls { dns cloudflare {env.CF_API_TOKEN} }
+#   }
+#
+# 注意：Cloudflare 橙云代理时 SSL/TLS 模式需为 Full（源站有真实证书），
+# 设为 Flexible 会因回源始终 http 导致重定向循环。
+
+services:
+  outlook-mail-local:
+    # !override 必须加：叠加文件的 ports/networks 默认是追加合并，
+    # 不加会把基础文件里的 "5000:5000" 和这里的 "127.0.0.1:5000:5000"
+    # 叠成两条冲突绑定导致启动失败
+    ports: !override
+      - "127.0.0.1:5000:5000"
+    networks: !override
+      - default
+      - caddy_caddy_net
+
+networks:
+  # 宿主机 Caddy 所在 compose 项目的默认网络（项目目录 /opt/caddy 时名为 caddy_caddy_net）
+  caddy_caddy_net:
+    external: true

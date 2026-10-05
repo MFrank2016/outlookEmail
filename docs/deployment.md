@@ -258,3 +258,44 @@ your-domain.com {
 # 重载（自动 HTTPS）
 sudo systemctl reload caddy
 ```
+
+### Docker Compose + 宿主机 Caddy（复用 80/443）
+
+当宿主机已有一套 Caddy 容器占用 80/443（例如统一管理多个子域名）时，无需再起一套
+Caddy，只需把本服务接入 Caddy 所在的 Docker 网络即可。仓库提供了叠加文件
+`docker-compose.caddy.yml`：
+
+```bash
+docker compose -f docker-compose.build.yml -f docker-compose.caddy.yml up -d
+```
+
+该叠加文件会做两件事：
+
+- 把容器接入外部网络 `caddy_caddy_net`（宿主机 Caddy 所在 compose 项目的默认网络，
+  网络名以实际项目目录为准，可用 `docker network ls` 确认）
+- 把 5000 端口收紧为 `127.0.0.1:5000`，公网只保留域名入口
+
+随后在宿主机 Caddyfile 中增加站点块并重载（`caddy reload --config /etc/caddy/Caddyfile`）：
+
+```
+outlook.example.com {
+    reverse_proxy http://outlook-mail-local:5000 {
+        header_up Host {host}
+        header_up X-Real-IP {remote_host}
+        header_up X-Forwarded-For {remote_host}
+        header_up X-Forwarded-Proto {scheme}
+    }
+    encode zstd gzip
+    tls { dns cloudflare {env.CF_API_TOKEN} }
+}
+```
+
+注意：
+
+- 回源地址用的是**容器名**（`outlook-mail-local`），依赖共享网络内的 Docker DNS，
+  不是 `localhost:5000`
+- 域名走 Cloudflare 橙云代理时，SSL/TLS 模式需为 **Full**；设为 Flexible 会因回源
+  始终为 http 导致重定向循环
+- 若域名在 Cloudflare 且 80/443 入站受限，用 `tls { dns cloudflare ... }` 走 DNS-01
+  验证签发证书（如上例）；能直连公网 80 端口则可省略该行，让 Caddy 自动 HTTP-01
+- 应用已内置 `ProxyFix`，`X-Forwarded-Proto` 等头由 Caddy 注入，无需额外配置
