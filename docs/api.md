@@ -90,6 +90,7 @@
 | GET | `/api/accounts/<account_id>/aliases` | Session | JSON | 获取账号别名 |
 | PUT | `/api/accounts/<account_id>/aliases` | Session + CSRF | JSON | 整体替换账号别名 |
 | POST | `/api/accounts/batch-update-group` | Session + CSRF | JSON | 批量改分组 |
+| POST | `/api/accounts/batch-update-status` | Session + CSRF | JSON | 批量启用或停用账号 |
 | POST | `/api/accounts/batch-update-forwarding` | Session + CSRF | JSON | 批量改转发开关 |
 | POST | `/api/accounts/batch-update-proxy` | Session + CSRF | JSON | 批量改账号级代理 |
 | GET | `/api/tags` | Session | JSON | 获取标签列表 |
@@ -1456,6 +1457,24 @@ Content-Type: application/json
 }
 ```
 
+### POST `/api/accounts/batch-update-status`
+
+批量启用或停用正式邮箱账号，使用登录会话和 CSRF 校验。
+
+```json
+{
+  "account_ids": [1, 2, 3],
+  "status": "inactive"
+}
+```
+
+- `account_ids` 为账号 ID 数组，重复 ID 会去重，无效 ID 会忽略。
+- `status` 必须为 `active`（启用）或 `inactive`（停用）。
+- 返回 `updated_count`、`updated_accounts`、`unchanged_count` 和 `missing_ids`，已处于目标状态的账号不会重复更新。
+- 请求体或状态无效、没有可修改账号时返回 HTTP 400；未登录返回 HTTP 401。
+- 停用保留账号凭据和项目记录，后续项目领取、Token 刷新和自动转发会跳过该账号。已有项目领取状态不会被撤销；恢复启用也不会重置项目进度。
+- 主页支持批量启用和停用；Token 刷新管理仅展示启用的 Outlook 账号，可批量停用，恢复请使用主页入口。
+
 ### POST `/api/accounts/batch-update-forwarding`
 
 批量开启或关闭账号转发。
@@ -2659,6 +2678,7 @@ POST /api/cloudflare/channels
 | `forward_account_delay_seconds` | 串行模式下账号间隔秒数；并行模式返回 `0` |
 | `forward_email_window_minutes` | 转发时间窗口 |
 | `forward_include_junkemail` | 是否转发垃圾箱 |
+| `forward_keywords` | 转发关键词文本，每行一个，默认空字符串（全部转发） |
 | `email_forward_recipient` | SMTP 转发收件人 |
 | `smtp_host` | SMTP 主机 |
 | `smtp_port` | SMTP 端口 |
@@ -2728,6 +2748,7 @@ POST /api/cloudflare/channels
 | `forward_account_delay_seconds` | int | 串行模式下账号间隔，范围 `0-60`；并行模式会保存为 `0` |
 | `forward_email_window_minutes` | int | 转发邮件时间范围，范围 `0-10080`，`0` 表示不限制 |
 | `forward_include_junkemail` | bool | 是否把垃圾箱邮件也纳入转发轮询 |
+| `forward_keywords` | string | 每行一个关键词，主题或完整可见正文包含任一项才转发，不区分大小写；空字符串关闭筛选，保存时去除空行及重复项 |
 | `forward_channels` | array<string> | `smtp` / `telegram` / `wecom` |
 | `email_forward_recipient` | string | SMTP 转发收件人 |
 | `smtp_host` | string | SMTP 主机 |
@@ -2752,6 +2773,7 @@ POST /api/cloudflare/channels
   "forward_account_delay_seconds": 0,
   "forward_email_window_minutes": 30,
   "forward_include_junkemail": true,
+  "forward_keywords": "Access deactivated\n账号已停用",
   "smtp_provider": "outlook",
   "forward_channels": ["smtp", "telegram"]
 }
