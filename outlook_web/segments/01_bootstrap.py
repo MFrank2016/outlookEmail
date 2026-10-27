@@ -581,6 +581,9 @@ IMAP_IDENTITY_FIELDS = {
 }
 
 MAIL_PROVIDERS = {
+    "icloud": {
+        "label": "iCloud", "imap_host": "imap.mail.me.com", "imap_port": 993, "account_type": "imap",
+    },
     "outlook": {
         "label": "Outlook",
         "imap_host": IMAP_SERVER_NEW,
@@ -638,6 +641,7 @@ MAIL_PROVIDERS = {
 }
 
 DOMAIN_PROVIDER_MAP = {
+    "icloud.com": "icloud", "me.com": "icloud", "mac.com": "icloud",
     "outlook.com": "outlook",
     "hotmail.com": "outlook",
     "live.com": "outlook",
@@ -703,9 +707,11 @@ IMAP_FOLDER_MATCH_ALIASES = {
 FORWARD_CHANNEL_EMAIL = "email"
 FORWARD_CHANNEL_TELEGRAM = "telegram"
 FORWARD_CHANNEL_WECOM = "wecom"
+FORWARD_CHANNEL_FEISHU = "feishu"
 FORWARD_CHANNEL_SMTP_SETTING = "smtp"
 FORWARD_CHANNEL_TG_SETTING = "telegram"
 FORWARD_CHANNEL_WECOM_SETTING = "wecom"
+FORWARD_CHANNEL_FEISHU_SETTING = "feishu"
 SMTP_FORWARD_PROVIDERS = ('outlook', 'qq', '163', '126', 'yahoo', 'aliyun', 'custom')
 
 # 数据库文件
@@ -735,6 +741,7 @@ INDEX_CSS_FILES = (
     'css/index/06-modals-toast.css',
     'css/index/07-meta.css',
     'css/index/08-responsive.css',
+    'css/index/09-icloud.css',
 )
 INDEX_JS_FILES = (
     'js/index/01-core.js',
@@ -750,6 +757,7 @@ INDEX_JS_FILES = (
     'js/index/11-email-shares.js',
     'js/index/12-outlook-upload-accounts.js',
     'js/index/13-projects.js',
+    'js/index/14-icloud.js',
 )
 
 # GPTMail API 配置
@@ -1598,6 +1606,7 @@ def init_db():
             account_id INTEGER NOT NULL,
             token_hash TEXT UNIQUE NOT NULL,
             token_encrypted TEXT NOT NULL,
+            access_code_hash TEXT,
             expires_at TIMESTAMP,
             never_expires INTEGER NOT NULL DEFAULT 0,
             max_email_count INTEGER CHECK (
@@ -1622,6 +1631,8 @@ def init_db():
     email_share_columns = [col[1] for col in cursor.fetchall()]
     if 'max_email_count' not in email_share_columns:
         cursor.execute('ALTER TABLE email_share_links ADD COLUMN max_email_count INTEGER')
+    if 'access_code_hash' not in email_share_columns:
+        cursor.execute('ALTER TABLE email_share_links ADD COLUMN access_code_hash TEXT')
 
     # 创建审计日志表
     cursor.execute('''
@@ -2287,6 +2298,14 @@ def init_db():
     ''')
     cursor.execute('''
         INSERT OR IGNORE INTO settings (key, value)
+        VALUES ('feishu_webhook_url', '')
+    ''')
+    cursor.execute('''
+        INSERT OR IGNORE INTO settings (key, value)
+        VALUES ('feishu_sign_secret', '')
+    ''')
+    cursor.execute('''
+        INSERT OR IGNORE INTO settings (key, value)
         VALUES ('webdav_backup_enabled', 'false')
     ''')
     cursor.execute('''
@@ -2512,6 +2531,9 @@ def init_db():
 
     # 迁移现有明文数据为加密数据
     migrate_sensitive_data(conn)
+
+    from outlook_web.icloud_store import init_icloud_schema
+    init_icloud_schema(conn)
 
     conn.commit()
     conn.close()
