@@ -1,4 +1,5 @@
 from __future__ import annotations
+from outlook_web.icloud_mail import message_recipient_headers
 
 import secrets
 
@@ -363,6 +364,9 @@ def build_graph_refresh_scope(graph_scopes: List[str]) -> str:
 
 
 def get_graph_token_scope_candidates(include_original_scope_fallback: bool = False) -> List[tuple[str, str]]:
+    if include_original_scope_fallback:
+        return [('default', GRAPH_DEFAULT_TOKEN_SCOPE), ('original', '')]
+
     configured_graph_scopes = [
         scope for scope in OAUTH_GRAPH_SCOPES
         if str(scope or '').startswith('https://graph.microsoft.com/')
@@ -381,9 +385,6 @@ def get_graph_token_scope_candidates(include_original_scope_fallback: bool = Fal
         ('read', build_graph_refresh_scope(read_graph_scopes)),
         ('default', GRAPH_DEFAULT_TOKEN_SCOPE),
     ]
-    if include_original_scope_fallback:
-        raw_candidates.append(('original', ''))
-
     candidates = []
     seen_scopes = set()
     for label, scope in raw_candidates:
@@ -418,11 +419,22 @@ def is_graph_token_scope_retryable_response(response) -> bool:
     ))
 
 
+def extract_refresh_token_from_response(response) -> str:
+    """只提取响应中非空的 refresh_token，未返回时保留已有 token。"""
+    try:
+        payload = response.json()
+    except ValueError:
+        return ''
+    token = payload.get('refresh_token') if isinstance(payload, dict) else None
+    return token.strip() if isinstance(token, str) else ''
+
+
 def request_graph_token_response(client_id: str, refresh_token: str, proxy_url: str = None,
                                  fallback_proxy_urls: Optional[List[str]] = None,
                                  include_original_scope_fallback: bool = False):
-    """请求 Graph token，优先使用授权时的显式委托 scope，避免 .default 依赖应用预配置权限。"""
+    """拉信优先显式 scope；刷新优先 .default，缺少 refresh_token 时尝试原始 scope。"""
     last_response = None
+    successful_response = None
     candidates = get_graph_token_scope_candidates(include_original_scope_fallback)
     for index, (_label, scope) in enumerate(candidates):
         data = {
@@ -433,16 +445,29 @@ def request_graph_token_response(client_id: str, refresh_token: str, proxy_url: 
         if scope:
             data["scope"] = scope
 
-        response = post_with_proxy_fallback(
-            TOKEN_URL_GRAPH,
-            data=data,
-            timeout=HTTP_REQUEST_TIMEOUT,
-            proxy_url=proxy_url,
-            fallback_proxy_urls=fallback_proxy_urls,
-        )
+        try:
+            response = post_with_proxy_fallback(
+                TOKEN_URL_GRAPH,
+                data=data,
+                timeout=HTTP_REQUEST_TIMEOUT,
+                proxy_url=proxy_url,
+                fallback_proxy_urls=fallback_proxy_urls,
+            )
+        except requests.exceptions.RequestException:
+            if successful_response is not None:
+                return successful_response
+            raise
         last_response = response
         if response.status_code == 200:
-            return response
+            if not include_original_scope_fallback or extract_refresh_token_from_response(response):
+                return response
+            if successful_response is None:
+                successful_response = response
+            if index == len(candidates) - 1:
+                return successful_response
+            continue
+        if successful_response is not None:
+            return successful_response
         if index == len(candidates) - 1 or not is_graph_token_scope_retryable_response(response):
             return response
 
@@ -813,7 +838,7 @@ def get_emails_graph(client_id: str, refresh_token: str, folder: str = 'inbox', 
         params = {
             "$top": top,
             "$skip": skip,
-            "$select": "id,subject,from,toRecipients,receivedDateTime,isRead,hasAttachments,bodyPreview",
+            "$select": "id,subject,from,toRecipients,ccRecipients,internetMessageHeaders,receivedDateTime,isRead,hasAttachments,bodyPreview",
             "$orderby": "receivedDateTime desc"
         }
         headers = {
@@ -895,7 +920,7 @@ def get_email_detail_graph_result(client_id: str, refresh_token: str, message_id
     try:
         url = f"https://graph.microsoft.com/v1.0/me/messages/{message_id}"
         params = {
-            "$select": "id,subject,from,toRecipients,ccRecipients,receivedDateTime,isRead,hasAttachments,body,bodyPreview"
+            "$select": "id,subject,from,toRecipients,ccRecipients,internetMessageHeaders,receivedDateTime,isRead,hasAttachments,body,bodyPreview"
         }
         headers = {
             "Authorization": f"Bearer {access_token}",
@@ -1403,6 +1428,7 @@ def get_emails_imap_with_server(account: str, client_id: str, refresh_token: str
                         'id': msg_id.decode() if isinstance(msg_id, bytes) else str(msg_id),
                         'subject': decode_header_value(msg.get("Subject", "无主题")),
                         'from': decode_header_value(msg.get("From", "未知发件人")),
+                        'recipient_headers': message_recipient_headers(msg),
                         'to': decode_header_value(msg.get("To", "")),
                         'date': internal_date or msg.get("Date", "未知时间"),
                         'id_mode': id_mode,
@@ -1862,6 +1888,7 @@ def build_email_detail_from_message(msg, message_id: str, date_value: str = '') 
         'id': str(message_id),
         'subject': decode_header_value(msg.get('Subject', '无主题')),
         'from': decode_header_value(msg.get('From', '未知发件人')),
+        'recipient_headers': message_recipient_headers(msg),
         'to': decode_header_value(msg.get('To', '')),
         'cc': decode_header_value(msg.get('Cc', '')),
         'date': date_value or msg.get('Date', ''),
@@ -2713,7 +2740,7 @@ def delete_emails_imap_generic_result(email_addr: str, imap_password: str, imap_
 def get_emails_imap_generic(email_addr: str, imap_password: str, imap_host: str,
                             imap_port: int = 993, folder: str = 'inbox',
                             provider: str = 'custom', skip: int = 0, top: int = 20,
-                            proxy_url: str = '') -> Dict[str, Any]:
+                            proxy_url: str = '', recipient_address: str = '') -> Dict[str, Any]:
     require_stable_ids = email_share_stable_ids_context.get()
     mail = None
     imap_id_info = {}
@@ -2771,7 +2798,15 @@ def get_emails_imap_generic(email_addr: str, imap_password: str, imap_host: str,
                 if selected_exists > 0:
                     break
 
-        if require_stable_ids:
+        if recipient_address:
+            safe_address = recipient_address.replace('\\', '\\\\').replace('"', '\\"')
+            criteria = '(OR OR OR HEADER To "{0}" HEADER Cc "{0}" HEADER Delivered-To "{0}" HEADER X-Original-To "{0}")'.format(safe_address)
+            status, data = mail.uid('SEARCH', None, criteria)
+            if status != 'OK':
+                return {'success': False, 'error': 'IMAP 收件人候选搜索失败', 'scan_incomplete': True}
+            message_ids = data[0].split() if data and data[0] else []
+            search_mode = 'uid'
+        elif require_stable_ids:
             message_ids, search_attempts = search_imap_message_uids_by_arrival(mail)
             if message_ids is None:
                 return {
@@ -2868,6 +2903,7 @@ def get_emails_imap_generic(email_addr: str, imap_password: str, imap_host: str,
                     'id': uid.decode('utf-8', errors='ignore') if isinstance(uid, (bytes, bytearray)) else str(uid),
                     'subject': decode_header_value(msg.get('Subject', '无主题')),
                     'from': decode_header_value(msg.get('From', '未知')),
+                    'recipient_headers': message_recipient_headers(msg),
                     'to': decode_header_value(msg.get('To', '')),
                     'date': internal_date or msg.get('Date', ''),
                     'id_mode': (

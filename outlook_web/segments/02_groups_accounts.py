@@ -971,6 +971,10 @@ def validate_account_aliases(account_id: int, primary_email: str, aliases: List[
         if normalized == primary_normalized:
             errors.append(f'别名 {normalized} 不能与主邮箱相同')
             continue
+        if (get_db().execute('SELECT 1 FROM icloud_hme_aliases WHERE address=?', (normalized,)).fetchone()
+                and not get_db().execute('SELECT 1 FROM account_aliases WHERE account_id=? AND LOWER(alias_email)=? AND icloud_alias_id IS NULL', (account_id, normalized)).fetchone()):
+            errors.append(f'别名 {normalized} 由 iCloud 管理，请前往 iCloud 管理修改')
+            continue
         if email_exists_as_primary(normalized, exclude_account_id=account_id):
             errors.append(f'别名 {normalized} 已被其他主邮箱占用')
             continue
@@ -988,12 +992,15 @@ def validate_account_aliases(account_id: int, primary_email: str, aliases: List[
 
 def replace_account_aliases(account_id: int, primary_email: str, aliases: List[str], db=None) -> tuple[bool, List[str], List[str]]:
     database = db or get_db()
+    managed = {row[0].lower() for row in database.execute(
+        'SELECT alias_email FROM account_aliases WHERE account_id=? AND icloud_alias_id IS NOT NULL', (account_id,))}
+    aliases = [alias for alias in aliases if normalize_email_address(alias) not in managed]
     cleaned_aliases, errors = validate_account_aliases(account_id, primary_email, aliases)
     if errors:
         return False, cleaned_aliases, errors
 
     try:
-        database.execute('DELETE FROM account_aliases WHERE account_id = ?', (account_id,))
+        database.execute('DELETE FROM account_aliases WHERE account_id = ? AND icloud_alias_id IS NULL', (account_id,))
         for alias_email in cleaned_aliases:
             database.execute(
                 '''
@@ -1094,19 +1101,20 @@ def resolve_account_by_address(email_addr: str) -> Optional[Dict]:
     if row:
         return resolve_account_record(row)
 
-    alias_row = db.execute(
-        '''
-        SELECT a.*, aa.alias_email AS matched_alias
-        FROM account_aliases aa
-        JOIN accounts a ON a.id = aa.account_id
-        WHERE LOWER(aa.alias_email) = ?
-        LIMIT 1
-        ''',
-        (normalized,)
-    ).fetchone()
-    if not alias_row:
-        return None
-    return resolve_account_record(alias_row, matched_alias=alias_row['matched_alias'])
+    manual_alias = db.execute('''SELECT a.*, aa.alias_email AS matched_alias FROM account_aliases aa
+        JOIN accounts a ON a.id=aa.account_id WHERE LOWER(aa.alias_email)=? AND aa.icloud_alias_id IS NULL LIMIT 1''', (normalized,)).fetchone()
+    if manual_alias:
+        return resolve_account_record(manual_alias, matched_alias=manual_alias['matched_alias'])
+
+    from outlook_web.icloud_store import ICloudStore
+    context = ICloudStore(db, get_cipher()).resolve(normalized)
+    if context:
+        row = db.execute('SELECT * FROM accounts WHERE id=?', (context['mailbox_account_id'],)).fetchone()
+        account = resolve_account_record(row, matched_alias=normalized)
+        account.update(context)
+        return account
+
+    return None
 
 
 def build_plus_fallback_emails(email_addr: str) -> List[str]:
@@ -1415,8 +1423,14 @@ def serialize_account_summary(account: Dict[str, Any], last_refresh_log: Optiona
         'forward_enabled': bool(account.get('forward_enabled')),
         'proxy_override_enabled': account_has_proxy_override(account),
         'last_refresh_at': refresh_state['last_refresh_at'],
+        'last_refresh_success_at': account.get('last_refresh_success_at'),
+        'refresh_token_updated_at': account.get('refresh_token_updated_at'),
         'last_refresh_status': refresh_state['last_refresh_status'],
         'last_refresh_error': refresh_state['last_refresh_error'],
+        'last_refresh_token_rotated': (
+            bool(account['last_refresh_token_rotated'])
+            if account.get('last_refresh_token_rotated') is not None else None
+        ),
         'created_at': account.get('created_at', ''),
         'updated_at': account.get('updated_at', ''),
         'tags': account.get('tags', [])
@@ -2800,6 +2814,14 @@ def claim_project_account(project_key: str, caller_id: str, task_id: str, lease_
             WHERE pa.project_id = ?
               AND pa.status = 'toClaim'
               AND a.status = 'active'
+              AND (NOT EXISTS (SELECT 1 FROM icloud_hme_aliases h WHERE h.address=pa.normalized_email)
+                   OR LOWER(a.email)=pa.normalized_email
+                   OR EXISTS (SELECT 1 FROM account_aliases aa WHERE aa.account_id=pa.account_id
+                        AND LOWER(aa.alias_email)=pa.normalized_email AND aa.icloud_alias_id IS NULL)
+                   OR EXISTS (SELECT 1 FROM icloud_hme_aliases h JOIN account_aliases aa ON aa.icloud_alias_id=h.id
+                        JOIN icloud_accounts ia ON ia.id=h.account_id WHERE h.address=pa.normalized_email
+                          AND aa.account_id=pa.account_id AND h.state='active' AND h.conflict=''
+                          AND ia.enabled=1 AND ia.binding_lost=0))
               AND NOT EXISTS (
                     SELECT 1 FROM project_accounts pa2
                     WHERE pa2.account_id = pa.account_id
@@ -3377,6 +3399,49 @@ def delete_accounts_by_ids(account_ids: List[int]) -> Dict[str, Any]:
             'deleted_count': len(existing_ids),
             'deleted_accounts': deleted_accounts,
             'missing_ids': missing_ids,
+        }
+    except Exception as e:
+        db.rollback()
+        return {'success': False, 'error': str(e)}
+
+
+def update_accounts_status_by_ids(account_ids: List[int], status: str) -> Dict[str, Any]:
+    """批量启用或停用账号，保留凭据和项目状态。"""
+    if status not in ('active', 'inactive'):
+        return {'success': False, 'error': '账号状态仅支持 active 或 inactive'}
+    if not isinstance(account_ids, list):
+        return {'success': False, 'error': 'account_ids 必须为账号 ID 列表'}
+    normalized_ids = normalize_account_ids(account_ids)
+    if not normalized_ids:
+        return {'success': False, 'error': '请选择要修改的账号'}
+
+    db = get_db()
+    placeholders = ','.join('?' * len(normalized_ids))
+    rows = db.execute(
+        f'SELECT id, email, status FROM accounts WHERE id IN ({placeholders}) ORDER BY id',
+        normalized_ids,
+    ).fetchall()
+    if not rows:
+        return {'success': False, 'error': '未找到可修改的账号'}
+
+    existing_ids = {row['id'] for row in rows}
+    updated_rows = [row for row in rows if row['status'] != status]
+    updated_ids = [row['id'] for row in updated_rows]
+    try:
+        if updated_ids:
+            update_placeholders = ','.join('?' * len(updated_ids))
+            db.execute(
+                f'''UPDATE accounts SET status = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE id IN ({update_placeholders})''',
+                [status] + updated_ids,
+            )
+            db.commit()
+        return {
+            'success': True,
+            'updated_count': len(updated_ids),
+            'updated_accounts': [{'id': row['id'], 'email': row['email']} for row in updated_rows],
+            'unchanged_count': len(rows) - len(updated_rows),
+            'missing_ids': [account_id for account_id in normalized_ids if account_id not in existing_ids],
         }
     except Exception as e:
         db.rollback()

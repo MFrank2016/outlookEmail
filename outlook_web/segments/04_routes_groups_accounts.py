@@ -1702,6 +1702,26 @@ def api_batch_update_account_group():
         return jsonify({'success': False, 'error': str(e)})
 
 
+@app.route('/api/accounts/batch-update-status', methods=['POST'])
+@login_required
+def api_batch_update_account_status():
+    """批量启用或停用账号。"""
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({'success': False, 'error': '请求体必须为 JSON 对象'}), 400
+    result = update_accounts_status_by_ids(data.get('account_ids'), data.get('status'))
+    if not result.get('success'):
+        return jsonify(result), 400
+
+    action_label = '启用' if data['status'] == 'active' else '停用'
+    message = f"已{action_label} {result['updated_count']} 个账号"
+    if result['unchanged_count']:
+        message += f"，{result['unchanged_count']} 个账号已处于该状态"
+    if result['missing_ids']:
+        message += f"，忽略 {len(result['missing_ids'])} 个不存在的账号"
+    return jsonify({**result, 'message': message})
+
+
 @app.route('/api/accounts/batch-update-forwarding', methods=['POST'])
 @login_required
 def api_batch_update_account_forwarding():
@@ -1863,6 +1883,8 @@ def api_get_account(account_id):
             'has_imap_password': bool(account.get('imap_password')),
             'imap_password': account.get('imap_password', '') or '',
             'aliases': account.get('aliases', []),
+            'managed_aliases': [row[0] for row in get_db().execute(
+                'SELECT alias_email FROM account_aliases WHERE account_id=? AND icloud_alias_id IS NOT NULL', (account_id,))],
             'alias_count': account.get('alias_count', 0),
             'matched_alias': account.get('matched_alias', ''),
             'forward_enabled': bool(account.get('forward_enabled')),

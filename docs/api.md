@@ -90,6 +90,7 @@
 | GET | `/api/accounts/<account_id>/aliases` | Session | JSON | 获取账号别名 |
 | PUT | `/api/accounts/<account_id>/aliases` | Session + CSRF | JSON | 整体替换账号别名 |
 | POST | `/api/accounts/batch-update-group` | Session + CSRF | JSON | 批量改分组 |
+| POST | `/api/accounts/batch-update-status` | Session + CSRF | JSON | 批量启用或停用账号 |
 | POST | `/api/accounts/batch-update-forwarding` | Session + CSRF | JSON | 批量改转发开关 |
 | POST | `/api/accounts/batch-update-proxy` | Session + CSRF | JSON | 批量改账号级代理 |
 | GET | `/api/tags` | Session | JSON | 获取标签列表 |
@@ -1456,6 +1457,24 @@ Content-Type: application/json
 }
 ```
 
+### POST `/api/accounts/batch-update-status`
+
+批量启用或停用正式邮箱账号，使用登录会话和 CSRF 校验。
+
+```json
+{
+  "account_ids": [1, 2, 3],
+  "status": "inactive"
+}
+```
+
+- `account_ids` 为账号 ID 数组，重复 ID 会去重，无效 ID 会忽略。
+- `status` 必须为 `active`（启用）或 `inactive`（停用）。
+- 返回 `updated_count`、`updated_accounts`、`unchanged_count` 和 `missing_ids`，已处于目标状态的账号不会重复更新。
+- 请求体或状态无效、没有可修改账号时返回 HTTP 400；未登录返回 HTTP 401。
+- 停用保留账号凭据和项目记录，后续项目领取、Token 刷新和自动转发会跳过该账号。已有项目领取状态不会被撤销；恢复启用也不会重置项目进度。
+- 主页支持批量启用和停用；Token 刷新管理仅展示启用的 Outlook 账号，可批量停用，恢复请使用主页入口。
+
 ### POST `/api/accounts/batch-update-forwarding`
 
 批量开启或关闭账号转发。
@@ -2025,10 +2044,13 @@ Web 端提供项目管理界面：在「设置 → 常规设置 → 项目管理
 | GET | `/api/accounts/trigger-scheduled-refresh` | Query: `force=true/false` | 手动触发一次“定时刷新”逻辑，返回 `text/event-stream` |
 | POST | `/api/accounts/stop-full-refresh` | 无 | 请求停止当前全量刷新任务 |
 
+单账号刷新与重试成功时返回 `token_rotated` 和 `message`：仅当新 Refresh Token 与旧值不同且成功写库，`token_rotated` 才为 `true`，文案为“刷新成功，Token 已更新”；未返回新值或返回旧值时为 `false`，文案为“验证成功，Token 未轮换，继续使用原 Token”。成功获取新值但保存失败会返回刷新失败。
+
 `/api/accounts/refresh-all`、`/api/accounts/refresh-failed-stream`、`/api/accounts/refresh-selected-stream/<task_id>`、`/api/accounts/trigger-scheduled-refresh` 都会返回 SSE 事件流，常见事件类型包括：
 
 - `start`
 - `progress`
+- `account_result`：包含单账号的 `status`、`message` 和 `token_rotated`
 - `delay`
 - `complete`
 
@@ -2083,6 +2105,8 @@ Web 端提供项目管理界面：在「设置 → 常规设置 → 项目管理
 - `requested_count`
 - `processed_count`
 - `success_count`
+- `rotated_count`：成功且 Token 已轮换的账号数
+- `unrotated_count`：成功但 Token 未轮换的账号数
 - `failed_count`
 - `skipped_count`
 - `failed_list`
@@ -2099,6 +2123,10 @@ Web 端提供项目管理界面：在「设置 → 常规设置 → 项目管理
 | GET | `/api/accounts/refresh-status-list` | Query: `q`、`status`、`page`、`page_size` | 获取 Token 刷新管理邮箱列表 |
 
 `GET /api/accounts/refresh-logs/failed` 返回的是“当前仍处于失败状态的邮箱快照”，不再是历史失败日志列表。
+
+全局与单账号刷新日志包含 `token_rotated`（`true` / `false` / `null`）和对应的 `message`。旧日志的轮换结果为 `null`，表示未记录，不能推断为未轮换。刷新管理列表通过 `last_refresh_token_rotated` 返回最近一次结果，并展示三个独立时间：`last_refresh_at` 表示最近一次请求，`last_refresh_success_at` 表示最近一次成功刷新（未轮换也算成功），`refresh_token_updated_at` 表示最近一次 Token 更新。失败不覆盖成功时间，未轮换不覆盖 Token 更新时间；未知时间返回 `null`，界面显示 `-`。
+
+单账号刷新响应和 SSE 的 `account_result` 同时返回这三个数据库时间。旧账号首次迁移时会从成功日志和最近成功状态恢复可确认的成功时间，无记录的保持为空。
 
 `GET /api/accounts/refresh-status-list` 查询参数：
 
@@ -2659,6 +2687,7 @@ POST /api/cloudflare/channels
 | `forward_account_delay_seconds` | 串行模式下账号间隔秒数；并行模式返回 `0` |
 | `forward_email_window_minutes` | 转发时间窗口 |
 | `forward_include_junkemail` | 是否转发垃圾箱 |
+| `forward_keywords` | 转发关键词文本，每行一个，默认空字符串（全部转发） |
 | `email_forward_recipient` | SMTP 转发收件人 |
 | `smtp_host` | SMTP 主机 |
 | `smtp_port` | SMTP 端口 |
@@ -2728,6 +2757,7 @@ POST /api/cloudflare/channels
 | `forward_account_delay_seconds` | int | 串行模式下账号间隔，范围 `0-60`；并行模式会保存为 `0` |
 | `forward_email_window_minutes` | int | 转发邮件时间范围，范围 `0-10080`，`0` 表示不限制 |
 | `forward_include_junkemail` | bool | 是否把垃圾箱邮件也纳入转发轮询 |
+| `forward_keywords` | string | 每行一个关键词，主题或完整可见正文包含任一项才转发，不区分大小写；空字符串关闭筛选，保存时去除空行及重复项 |
 | `forward_channels` | array<string> | `smtp` / `telegram` / `wecom` |
 | `email_forward_recipient` | string | SMTP 转发收件人 |
 | `smtp_host` | string | SMTP 主机 |
@@ -2752,6 +2782,7 @@ POST /api/cloudflare/channels
   "forward_account_delay_seconds": 0,
   "forward_email_window_minutes": 30,
   "forward_include_junkemail": true,
+  "forward_keywords": "Access deactivated\n账号已停用",
   "smtp_provider": "outlook",
   "forward_channels": ["smtp", "telegram"]
 }
