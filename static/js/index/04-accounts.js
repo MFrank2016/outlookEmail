@@ -383,13 +383,13 @@
 
             pendingExportGroupIds = groupIds;
             pendingExportAccountIds = [];
+            pendingExportUploadAccountIds = [];
 
-            // 显示密码确认对话框
             hideExportModal();
-            showExportVerifyModal();
+            await exportWithVerifyFallback({ group_ids: groupIds }, '/api/accounts/export-selected');
         }
 
-        function startSelectedAccountExport(accountIds) {
+        async function startSelectedAccountExport(accountIds) {
             const normalizedIds = Array.from(new Set((accountIds || [])
                 .map(accountId => parseInt(accountId, 10))
                 .filter(Number.isFinite)));
@@ -402,10 +402,10 @@
             pendingExportGroupIds = [];
             pendingExportAccountIds = normalizedIds;
             pendingExportUploadAccountIds = [];
-            showExportVerifyModal();
+            await exportWithVerifyFallback({ account_ids: normalizedIds }, '/api/accounts/export-selected');
         }
 
-        function startUploadAccountExport(accountIds) {
+        async function startUploadAccountExport(accountIds) {
             const normalizedIds = Array.from(new Set((accountIds || [])
                 .map(id => parseInt(id, 10))
                 .filter(Number.isFinite)));
@@ -418,7 +418,62 @@
             pendingExportGroupIds = [];
             pendingExportAccountIds = [];
             pendingExportUploadAccountIds = normalizedIds;
-            showExportVerifyModal();
+            await exportWithVerifyFallback({ account_ids: normalizedIds }, '/api/outlook-upload-accounts/export-selected');
+        }
+
+        // 导出成功时下载文件；非文件响应返回 false 交给调用方处理
+        async function downloadExportFile(response) {
+            const contentType = response.headers.get('content-type') || '';
+            if (!response.ok || contentType.includes('application/json')) {
+                return false;
+            }
+
+            // 获取文件名
+            const contentDisposition = response.headers.get('Content-Disposition');
+            let filename = 'accounts.txt';
+            if (contentDisposition) {
+                const match = contentDisposition.match(/filename\*?=(?:UTF-8'')?([^;\n]+)/i);
+                if (match) {
+                    filename = decodeURIComponent(match[1]);
+                }
+            }
+
+            // 下载文件
+            const blob = await response.blob();
+            const url = window.URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = filename;
+            document.body.appendChild(a);
+            a.click();
+            window.URL.revokeObjectURL(url);
+            document.body.removeChild(a);
+            return true;
+        }
+
+        // 先直接导出；仅当服务端要求二次验证时才回退到密码框
+        async function exportWithVerifyFallback(exportPayload, exportUrl) {
+            try {
+                const response = await fetch(exportUrl, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(exportPayload)
+                });
+
+                if (await downloadExportFile(response)) {
+                    showToast('导出成功', 'success');
+                    return;
+                }
+
+                const data = await response.json().catch(() => ({}));
+                if (response.status === 401 && data.need_verify) {
+                    showExportVerifyModal();
+                    return;
+                }
+                handleApiError(data, '导出失败');
+            } catch (error) {
+                showToast('导出失败', 'error');
+            }
         }
 
         // 显示导出密码确认对话框
@@ -486,29 +541,7 @@
                     body: JSON.stringify(exportPayload)
                 });
 
-                const contentType = response.headers.get('content-type') || '';
-                if (response.ok && !contentType.includes('application/json')) {
-                    // 获取文件名
-                    const contentDisposition = response.headers.get('Content-Disposition');
-                    let filename = 'accounts.txt';
-                    if (contentDisposition) {
-                        const match = contentDisposition.match(/filename\*?=(?:UTF-8'')?([^;\n]+)/i);
-                        if (match) {
-                            filename = decodeURIComponent(match[1]);
-                        }
-                    }
-
-                    // 下载文件
-                    const blob = await response.blob();
-                    const url = window.URL.createObjectURL(blob);
-                    const a = document.createElement('a');
-                    a.href = url;
-                    a.download = filename;
-                    document.body.appendChild(a);
-                    a.click();
-                    window.URL.revokeObjectURL(url);
-                    document.body.removeChild(a);
-
+                if (await downloadExportFile(response)) {
                     showToast('导出成功', 'success');
                     hideExportVerifyModal();
                 } else {

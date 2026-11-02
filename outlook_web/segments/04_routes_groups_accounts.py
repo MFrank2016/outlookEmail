@@ -426,20 +426,21 @@ def append_temp_email_export_sections(lines: List[str], temp_emails: List[Dict[s
 @app.route('/api/groups/<int:group_id>/export')
 @login_required
 def api_export_group(group_id):
-    """导出分组下的所有邮箱账号为 TXT 文件（需要二次验证）"""
-    # 检查二次验证token（使用内存存储）
-    verify_token = request.args.get('verify_token')
-    import time
-    if not verify_token or verify_token not in export_verify_tokens:
-        return jsonify({'success': False, 'error': '需要二次验证', 'need_verify': True}), 401
-    
-    token_data = export_verify_tokens[verify_token]
-    if token_data['expires'] < time.time():
+    """导出分组下的所有邮箱账号为 TXT 文件"""
+    if EXPORT_VERIFY_ENABLED:
+        # 检查二次验证token（使用内存存储）
+        verify_token = request.args.get('verify_token')
+        import time
+        if not verify_token or verify_token not in export_verify_tokens:
+            return jsonify({'success': False, 'error': '需要二次验证', 'need_verify': True}), 401
+
+        token_data = export_verify_tokens[verify_token]
+        if token_data['expires'] < time.time():
+            del export_verify_tokens[verify_token]
+            return jsonify({'success': False, 'error': '验证已过期，请重新验证', 'need_verify': True}), 401
+
+        # 清除验证token（一次性使用）
         del export_verify_tokens[verify_token]
-        return jsonify({'success': False, 'error': '验证已过期，请重新验证', 'need_verify': True}), 401
-    
-    # 清除验证token（一次性使用）
-    del export_verify_tokens[verify_token]
 
     group = get_group_by_id(group_id)
     if not group:
@@ -583,20 +584,21 @@ def build_all_groups_export_content() -> Dict[str, Any]:
 @app.route('/api/accounts/export')
 @login_required
 def api_export_all_accounts():
-    """导出所有邮箱账号为 TXT 文件（需要二次验证）"""
-    # 检查二次验证token（使用内存存储）
-    verify_token = request.args.get('verify_token')
-    import time
-    if not verify_token or verify_token not in export_verify_tokens:
-        return jsonify({'success': False, 'error': '需要二次验证', 'need_verify': True}), 401
-    
-    token_data = export_verify_tokens[verify_token]
-    if token_data['expires'] < time.time():
+    """导出所有邮箱账号为 TXT 文件"""
+    if EXPORT_VERIFY_ENABLED:
+        # 检查二次验证token（使用内存存储）
+        verify_token = request.args.get('verify_token')
+        import time
+        if not verify_token or verify_token not in export_verify_tokens:
+            return jsonify({'success': False, 'error': '需要二次验证', 'need_verify': True}), 401
+
+        token_data = export_verify_tokens[verify_token]
+        if token_data['expires'] < time.time():
+            del export_verify_tokens[verify_token]
+            return jsonify({'success': False, 'error': '验证已过期，请重新验证', 'need_verify': True}), 401
+
+        # 清除验证token（一次性使用）
         del export_verify_tokens[verify_token]
-        return jsonify({'success': False, 'error': '验证已过期，请重新验证', 'need_verify': True}), 401
-    
-    # 清除验证token（一次性使用）
-    del export_verify_tokens[verify_token]
 
 
     # 使用 load_accounts 获取所有账号（自动解密）
@@ -633,34 +635,36 @@ def api_export_all_accounts():
 @app.route('/api/accounts/export-selected', methods=['POST'])
 @login_required
 def api_export_selected_accounts():
-    """导出选中分组或选中账号为 TXT 文件（需要二次验证）"""
+    """导出选中分组或选中账号为 TXT 文件"""
     data = request.get_json(silent=True) or {}
     group_ids = data.get('group_ids', [])
     account_ids = data.get('account_ids', [])
-    verify_token = data.get('verify_token')
 
-    # 检查二次验证token（使用内存存储）
-    import time
-    if not verify_token or verify_token not in export_verify_tokens:
-        return jsonify({'success': False, 'error': '需要二次验证', 'need_verify': True}), 401
-    
-    token_data = export_verify_tokens[verify_token]
-    
-    # 检查是否过期
-    if token_data['expires'] < time.time():
+    if EXPORT_VERIFY_ENABLED:
+        verify_token = data.get('verify_token')
+
+        # 检查二次验证token（使用内存存储）
+        import time
+        if not verify_token or verify_token not in export_verify_tokens:
+            return jsonify({'success': False, 'error': '需要二次验证', 'need_verify': True}), 401
+
+        token_data = export_verify_tokens[verify_token]
+
+        # 检查是否过期
+        if token_data['expires'] < time.time():
+            del export_verify_tokens[verify_token]
+            return jsonify({'success': False, 'error': '验证已过期，请重新验证', 'need_verify': True}), 401
+
+        # 可选：验证 IP 一致性（增强安全性）
+        client_ip = request.headers.get('X-Forwarded-For', request.remote_addr)
+        if client_ip:
+            client_ip = client_ip.split(',')[0].strip()
+        # 注意：由于 Cloudflare 可能使用不同边缘节点，IP 可能变化，暂不强制验证
+        # if token_data['ip'] != client_ip:
+        #     return jsonify({'success': False, 'error': 'IP 不匹配', 'need_verify': True}), 401
+
+        # 清除验证token（一次性使用）
         del export_verify_tokens[verify_token]
-        return jsonify({'success': False, 'error': '验证已过期，请重新验证', 'need_verify': True}), 401
-    
-    # 可选：验证 IP 一致性（增强安全性）
-    client_ip = request.headers.get('X-Forwarded-For', request.remote_addr)
-    if client_ip:
-        client_ip = client_ip.split(',')[0].strip()
-    # 注意：由于 Cloudflare 可能使用不同边缘节点，IP 可能变化，暂不强制验证
-    # if token_data['ip'] != client_ip:
-    #     return jsonify({'success': False, 'error': 'IP 不匹配', 'need_verify': True}), 401
-    
-    # 清除验证token（一次性使用）
-    del export_verify_tokens[verify_token]
 
     if account_ids:
         export_payload = build_selected_account_export_content(account_ids)

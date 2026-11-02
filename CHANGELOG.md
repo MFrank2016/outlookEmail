@@ -6,6 +6,15 @@ The format is based on Keep a Changelog, and this project follows Semantic Versi
 
 ## [Unreleased]
 
+## [3.0.29] - 2026-11-02
+
+### Changed
+- 导出账号文件默认不再要求二次验证：`EXPORT_VERIFY_ENABLED` 未设置或不为 `1` 时，4 个导出接口无需 `verify_token` 即可直接导出。
+- 新增环境变量 `EXPORT_VERIFY_ENABLED`，设为 `1` 时恢复原有行为：导出前仍需通过 `/api/export/verify` 换取一次性 token。
+
+### Important
+- 默认关闭导出二次验证会降低导出操作的门槛，公开部署时建议设置 `EXPORT_VERIFY_ENABLED=1`。
+
 ## [3.0.28] - 2026-10-31
 
 ### Added

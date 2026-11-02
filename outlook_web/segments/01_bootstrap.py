@@ -786,6 +786,9 @@ CLOUDFLARE_AI_USERNAME_DEFAULT_PROMPT = os.getenv(
 # 临时邮箱分组 ID（系统保留）
 TEMP_EMAIL_GROUP_ID = -1
 
+# 导出二次验证开关：默认关闭，设为 1 时恢复导出前必须先换取 token 的行为
+EXPORT_VERIFY_ENABLED = os.getenv("EXPORT_VERIFY_ENABLED", "").strip() == "1"
+
 # 导出验证 Token 存储（内存存储，单 worker 模式下使用）
 # 格式: {user_session_id: {'token': verify_token, 'expires': timestamp}}
 export_verify_tokens = {}

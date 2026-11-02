@@ -1735,14 +1735,9 @@ class ProjectRuntimeTests(unittest.TestCase):
             web_outlook_app.set_setting('login_password', web_outlook_app.hash_password('export-pass'))
             db.commit()
 
-        verify_response = self.client.post('/api/export/verify', json={'password': 'export-pass'})
-        self.assertEqual(verify_response.status_code, 200)
-        verify_payload = verify_response.get_json()
-        self.assertTrue(verify_payload['success'])
-
+        # 默认不开启导出二次验证，不传 verify_token 也应直接导出成功
         response = self.client.post('/api/accounts/export-selected', json={
             'account_ids': [second_account_id, 999999, first_account_id],
-            'verify_token': verify_payload['verify_token'],
         })
 
         self.assertEqual(response.status_code, 200)
@@ -1778,14 +1773,9 @@ class ProjectRuntimeTests(unittest.TestCase):
             web_outlook_app.set_setting('login_password', web_outlook_app.hash_password('export-pass2'))
             db.commit()
 
-        verify_response = self.client.post('/api/export/verify', json={'password': 'export-pass2'})
-        self.assertEqual(verify_response.status_code, 200)
-        verify_payload = verify_response.get_json()
-        self.assertTrue(verify_payload['success'])
-
+        # 默认不开启导出二次验证，不传 verify_token 也应直接导出成功
         response = self.client.post('/api/outlook-upload-accounts/export-selected', json={
             'account_ids': [upload_id_a, upload_id_b, 999999],
-            'verify_token': verify_payload['verify_token'],
         })
 
         self.assertEqual(response.status_code, 200)
@@ -1826,12 +1816,9 @@ class ProjectRuntimeTests(unittest.TestCase):
             web_outlook_app.set_setting('login_password', web_outlook_app.hash_password('export-pass4'))
             db.commit()
 
-        verify_response = self.client.post('/api/export/verify', json={'password': 'export-pass4'})
-        verify_payload = verify_response.get_json()
-
+        # 默认不开启导出二次验证，不传 verify_token 也应直接导出成功
         response = self.client.post('/api/outlook-upload-accounts/export-selected', json={
             'account_ids': [upload_id],
-            'verify_token': verify_payload['verify_token'],
         })
 
         self.assertEqual(response.status_code, 200)
@@ -1846,15 +1833,36 @@ class ProjectRuntimeTests(unittest.TestCase):
         with self.app.app_context():
             web_outlook_app.set_setting('login_password', web_outlook_app.hash_password('export-pass3'))
 
-        verify_response = self.client.post('/api/export/verify', json={'password': 'export-pass3'})
-        verify_payload = verify_response.get_json()
-
+        # 默认不开启导出二次验证，空 id 仍应在导出前被参数校验拦下
         response = self.client.post('/api/outlook-upload-accounts/export-selected', json={
             'account_ids': [],
-            'verify_token': verify_payload['verify_token'],
         })
         self.assertEqual(response.status_code, 400)
         self.assertFalse(response.get_json()['success'])
+
+    def test_export_requires_verify_token_when_enabled(self):
+        account_id = self._insert_account('verify-required@example.com')
+        with self.app.app_context():
+            web_outlook_app.set_setting('login_password', web_outlook_app.hash_password('export-pass5'))
+
+        with patch.object(web_outlook_app, 'EXPORT_VERIFY_ENABLED', True):
+            blocked = self.client.post('/api/accounts/export-selected', json={
+                'account_ids': [account_id],
+            })
+            self.assertEqual(blocked.status_code, 401)
+            self.assertTrue(blocked.get_json()['need_verify'])
+
+            verify_response = self.client.post('/api/export/verify', json={'password': 'export-pass5'})
+            self.assertEqual(verify_response.status_code, 200)
+            verify_payload = verify_response.get_json()
+            self.assertTrue(verify_payload['success'])
+
+            allowed = self.client.post('/api/accounts/export-selected', json={
+                'account_ids': [account_id],
+                'verify_token': verify_payload['verify_token'],
+            })
+            self.assertEqual(allowed.status_code, 200)
+            self.assertIn('verify-required@example.com', allowed.get_data(as_text=True))
 
     def test_run_webdav_backup_uploads_all_group_export_file(self):
         self._insert_account('backup-upload@example.com', group_id=1)
