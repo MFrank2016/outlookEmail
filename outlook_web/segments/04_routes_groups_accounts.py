@@ -856,30 +856,22 @@ def api_external_get_accounts():
 
     want_random = str(request.args.get('random', '') or '').strip().lower() in {'1', 'true'}
 
-    accounts = load_accounts(group_id, include_descendants=False)
+    exclude_tag_ids = find_tag_ids_by_name(exclude_tag_name)
 
-    # 过滤在序列化之前完成，避免把全量账号序列化成 JSON
-    if suffix:
-        accounts = [
-            acc for acc in accounts
-            if str(acc.get('email') or '').strip().lower().endswith('@' + suffix)
-        ]
-
-    if exclude_tag_name:
-        accounts = [
-            acc for acc in accounts
-            if not any(
-                str(tag.get('name') or '').strip().lower() == exclude_tag_name
-                for tag in acc.get('tags', [])
-            )
-        ]
-
-    total = len(accounts)
-
-    if want_random:
-        accounts = [random.choice(accounts)] if accounts else []
-    elif limit is not None:
-        accounts = accounts[:limit]
+    total = count_accounts(
+        group_id,
+        include_descendants=False,
+        exclude_tag_ids=exclude_tag_ids,
+        email_suffix=suffix,
+    )
+    accounts = load_accounts(
+        group_id,
+        limit=1 if want_random else limit,
+        include_descendants=False,
+        exclude_tag_ids=exclude_tag_ids,
+        email_suffix=suffix,
+        random_order=want_random,
+    )
 
     safe_accounts = []
     for acc in accounts:

@@ -578,7 +578,8 @@ def normalize_account_search_terms(query: Any) -> List[str]:
 def build_account_where_clause(group_id: int = None, query: str = '',
                                tag_ids: Any = None, include_untagged: bool = False,
                                include_descendants: bool = True,
-                               exclude_tag_ids: Any = None) -> tuple[str, List[Any]]:
+                               exclude_tag_ids: Any = None,
+                               email_suffix: Any = None) -> tuple[str, List[Any]]:
     clauses = []
     params: List[Any] = []
 
@@ -613,6 +614,12 @@ def build_account_where_clause(group_id: int = None, query: str = '',
     if tag_clause:
         clauses.append(tag_clause)
         params.extend(tag_params)
+
+    normalized_suffix = str(email_suffix or '').strip().lower().lstrip('@')
+    if normalized_suffix:
+        # 只匹配主邮箱，不含别名
+        clauses.append('LOWER(a.email) LIKE ?')
+        params.append(f'%@{normalized_suffix}')
 
     if not clauses:
         return '', []
@@ -687,7 +694,9 @@ def load_accounts(group_id: int = None, limit: Any = None, offset: Any = 0,
                   sort_by: Any = 'created_at', sort_order: Any = 'desc',
                   tag_ids: Any = None, include_untagged: bool = False,
                   include_descendants: bool = True,
-                  exclude_tag_ids: Any = None) -> List[Dict]:
+                  exclude_tag_ids: Any = None,
+                  email_suffix: Any = None,
+                  random_order: bool = False) -> List[Dict]:
     """从数据库加载邮箱账号"""
     db = get_db()
     normalized_limit, normalized_offset = normalize_account_pagination(limit, offset)
@@ -697,8 +706,9 @@ def load_accounts(group_id: int = None, limit: Any = None, offset: Any = 0,
         include_untagged=include_untagged,
         include_descendants=include_descendants,
         exclude_tag_ids=exclude_tag_ids,
+        email_suffix=email_suffix,
     )
-    order_clause = build_account_order_clause(sort_by, sort_order)
+    order_clause = 'ORDER BY RANDOM()' if random_order else build_account_order_clause(sort_by, sort_order)
     pagination_clause = ''
     if normalized_limit is not None:
         pagination_clause = 'LIMIT ? OFFSET ?'
@@ -719,7 +729,8 @@ def load_accounts(group_id: int = None, limit: Any = None, offset: Any = 0,
 def count_accounts(group_id: int = None, query: str = '',
                    tag_ids: Any = None, include_untagged: bool = False,
                    include_descendants: bool = True,
-                   exclude_tag_ids: Any = None) -> int:
+                   exclude_tag_ids: Any = None,
+                   email_suffix: Any = None) -> int:
     db = get_db()
     normalized_query = str(query or '').strip()
     joins = '''
@@ -738,6 +749,7 @@ def count_accounts(group_id: int = None, query: str = '',
         include_untagged=include_untagged,
         include_descendants=include_descendants,
         exclude_tag_ids=exclude_tag_ids,
+        email_suffix=email_suffix,
     )
     count_expr = 'COUNT(DISTINCT a.id)' if normalized_query else 'COUNT(*)'
     row = db.execute(f'''
@@ -817,6 +829,18 @@ def normalize_account_status(status: Any) -> str:
 
 
 # ==================== 标签管理 ====================
+
+def find_tag_ids_by_name(name: Any) -> List[int]:
+    """按标签名（不区分大小写）解析标签 id，未匹配返回空列表"""
+    normalized_name = str(name or '').strip().lower()
+    if not normalized_name:
+        return []
+    rows = get_db().execute(
+        'SELECT id FROM tags WHERE LOWER(name) = ?',
+        (normalized_name,),
+    ).fetchall()
+    return [int(row['id']) for row in rows]
+
 
 def get_tags() -> List[Dict]:
     """获取所有标签"""
