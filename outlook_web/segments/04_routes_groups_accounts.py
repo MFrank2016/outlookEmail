@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import random
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 if TYPE_CHECKING:
@@ -839,7 +840,46 @@ def api_get_accounts():
 def api_external_get_accounts():
     """对外 API：通过 API Key 获取邮箱账号列表"""
     group_id = request.args.get('group_id', type=int)
+
+    suffix = str(request.args.get('suffix', '') or '').strip().lower().lstrip('@')
+    exclude_tag_name = str(request.args.get('exclude_tag', '') or '').strip().lower()
+
+    limit = None
+    limit_arg = request.args.get('limit')
+    if limit_arg is not None and str(limit_arg).strip() != '':
+        try:
+            limit = int(str(limit_arg).strip())
+        except (TypeError, ValueError):
+            return jsonify({'success': False, 'error': 'limit 必须是正整数'}), 400
+        if limit <= 0:
+            return jsonify({'success': False, 'error': 'limit 必须是正整数'}), 400
+
+    want_random = str(request.args.get('random', '') or '').strip().lower() in {'1', 'true'}
+
     accounts = load_accounts(group_id, include_descendants=False)
+
+    # 过滤在序列化之前完成，避免把全量账号序列化成 JSON
+    if suffix:
+        accounts = [
+            acc for acc in accounts
+            if str(acc.get('email') or '').strip().lower().endswith('@' + suffix)
+        ]
+
+    if exclude_tag_name:
+        accounts = [
+            acc for acc in accounts
+            if not any(
+                str(tag.get('name') or '').strip().lower() == exclude_tag_name
+                for tag in acc.get('tags', [])
+            )
+        ]
+
+    total = len(accounts)
+
+    if want_random:
+        accounts = [random.choice(accounts)] if accounts else []
+    elif limit is not None:
+        accounts = accounts[:limit]
 
     safe_accounts = []
     for acc in accounts:
@@ -854,7 +894,7 @@ def api_external_get_accounts():
 
     return jsonify({
         'success': True,
-        'total': len(safe_accounts),
+        'total': total,
         'accounts': safe_accounts
     })
 
