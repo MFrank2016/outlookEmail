@@ -589,7 +589,7 @@
             return mergedResult;
         }
 
-        async function tryRenderLocalRetainedEmails(email, cacheKey) {
+        async function tryRenderLocalRetainedEmails(email, cacheKey, context = null) {
             if (!isNormalMailLocalRetentionEnabled()) {
                 setMailSyncStatus('本地存储未启用');
                 return false;
@@ -598,7 +598,7 @@
                 const response = await fetchWithTimeout(
                     buildEmailListRequestUrl(email, {
                         source: 'local',
-                        folder: currentFolder,
+                        folder: context?.folder || currentFolder,
                         skip: 0,
                         top: 20
                     }),
@@ -610,6 +610,9 @@
                 const data = await response.json();
                 const retainedEmails = Array.isArray(data.emails) ? data.emails : [];
                 if (!data.success || retainedEmails.length === 0) {
+                    return false;
+                }
+                if (context && !isCurrentMailboxContext(context)) {
                     return false;
                 }
 
@@ -706,6 +709,10 @@
                 return false;
             }
 
+            if (options.context && !isCurrentMailboxContext(options.context)) {
+                return false;
+            }
+
             if (Object.keys(fetchErrorDetails).length > 0) {
                 showEmailFetchErrorModal(fetchErrorDetails);
             } else {
@@ -762,16 +769,18 @@
         // 加载邮件列表
         async function loadEmails(email, forceRefresh = false) {
             const container = document.getElementById('emailList');
+            const requestFolder = currentFolder;
+            const context = { account: email, folder: requestFolder };
 
             // 切换账号/刷新时清除选中状态
             selectedEmailIds.clear();
             updateEmailBatchActionBar();
             hideNewMailNotice();
-            pendingNewMailSyncs.delete(getPendingNewMailSyncKey(email, currentFolder));
+            pendingNewMailSyncs.delete(getPendingNewMailSyncKey(email, requestFolder));
             setMailSyncStatus('');
 
-            const cacheKey = `${email}_${currentFolder}`;
-            const cache = !forceRefresh ? getEmailListCacheEntry(email, currentFolder) : null;
+            const cacheKey = `${email}_${requestFolder}`;
+            const cache = !forceRefresh ? getEmailListCacheEntry(email, requestFolder) : null;
             if (cache) {
                 applyEmailListCache(cache, { scheduleLoadCheck: false });
                 return;
@@ -784,13 +793,19 @@
             let startedBackgroundSync = false;
 
             try {
-                if (isNormalMailboxListRequest() && await tryRenderLocalRetainedEmails(email, cacheKey)) {
+                if (isNormalMailboxListRequest() && await tryRenderLocalRetainedEmails(email, cacheKey, context)) {
                     startBackgroundRemoteMailboxSync(email, cacheKey);
                     startedBackgroundSync = true;
                     return;
                 }
-                await fetchRemoteEmails(email, cacheKey);
+                if (!isCurrentMailboxContext(context)) {
+                    return;
+                }
+                await fetchRemoteEmails(email, cacheKey, { folder: requestFolder, context });
             } catch (error) {
+                if (!isCurrentMailboxContext(context)) {
+                    return;
+                }
                 const browserError = buildBrowserMailFetchError(error);
                 const errorMessage = getFetchErrorMessage(error);
                 setMailSyncStatus('');
@@ -800,7 +815,7 @@
                     actionTitle: '刷新邮件列表'
                 });
             } finally {
-                if (!startedBackgroundSync) {
+                if (!startedBackgroundSync && isCurrentMailboxContext(context)) {
                     setEmailListLoadingState(false);
                 }
             }
