@@ -459,13 +459,15 @@ def normalize_account_pagination(limit: Any = None, offset: Any = 0) -> tuple[Op
 
 def normalize_account_sort(sort_by: Any = 'created_at', sort_order: Any = 'desc') -> tuple[str, str]:
     normalized_sort_by = str(sort_by or '').strip().lower()
-    if normalized_sort_by not in {'sort_order', 'created_at', 'email'}:
+    if normalized_sort_by not in {'sort_order', 'created_at', 'email', 'manual'}:
         normalized_sort_by = 'created_at'
 
     normalized_sort_order = str(sort_order or '').strip().lower()
     if normalized_sort_order not in {'asc', 'desc'}:
         normalized_sort_order = 'desc' if normalized_sort_by == 'created_at' else 'asc'
 
+    if normalized_sort_by == 'manual':
+        normalized_sort_order = 'asc'
     return normalized_sort_by, normalized_sort_order
 
 
@@ -473,6 +475,14 @@ def build_account_order_clause(sort_by: Any = 'created_at', sort_order: Any = 'd
     normalized_sort_by, normalized_sort_order = normalize_account_sort(sort_by, sort_order)
     direction = 'DESC' if normalized_sort_order == 'desc' else 'ASC'
 
+    if normalized_sort_by == 'manual':
+        return '''
+            ORDER BY
+                CASE WHEN COALESCE(a.manual_sort_order, 0) > 0 THEN 0 ELSE 1 END ASC,
+                a.manual_sort_order ASC,
+                CASE WHEN COALESCE(a.sort_order, 0) > 0 THEN 0 ELSE 1 END ASC,
+                a.sort_order ASC, a.created_at DESC, a.email COLLATE NOCASE ASC, a.id DESC
+        '''
     if normalized_sort_by == 'sort_order':
         return f'''
             ORDER BY
@@ -485,6 +495,33 @@ def build_account_order_clause(sort_by: Any = 'created_at', sort_order: Any = 'd
     if normalized_sort_by == 'email':
         return f'ORDER BY a.email COLLATE NOCASE {direction}, a.created_at DESC, a.id DESC'
     return f'ORDER BY a.created_at {direction}, a.email COLLATE NOCASE ASC, a.id DESC'
+
+
+def reorder_account(account_id: int, target_id: int, position: str) -> List[Dict[str, int]]:
+    """Move one account relative to another without changing numeric sort values.
+
+    Read and write under one lock so concurrent moves use the latest order. Moving
+    IDs, rather than replacing a visible page, preserves hidden accounts' order.
+    """
+    db = get_db()
+    try:
+        db.execute('BEGIN IMMEDIATE')
+        rows = db.execute(f"SELECT a.id, a.manual_sort_order FROM accounts a {build_account_order_clause('manual')}").fetchall()
+        ids = [row['id'] for row in rows]
+        if account_id not in ids or target_id not in ids:
+            raise ValueError('邮箱不存在，请刷新列表后重试')
+        ids.remove(account_id)
+        target_index = ids.index(target_id) + (1 if position == 'after' else 0)
+        ids.insert(target_index, account_id)
+        previous = {row['id']: row['manual_sort_order'] for row in rows}
+        changes = [(index, account_id) for index, account_id in enumerate(ids, 1)
+                   if previous[account_id] != index]
+        db.executemany('UPDATE accounts SET manual_sort_order = ? WHERE id = ?', changes)
+        db.commit()
+        return [{'id': account_id, 'manual_sort_order': index} for index, account_id in changes]
+    except Exception:
+        db.rollback()
+        raise
 
 
 def normalize_tag_filter_values(tag_ids: Any = None) -> List[int]:
@@ -1458,6 +1495,7 @@ def serialize_account_summary(account: Dict[str, Any], last_refresh_log: Optiona
         'group_name': account.get('group_name', '默认分组'),
         'group_color': account.get('group_color', '#666666'),
         'sort_order': normalize_account_sort_order(account.get('sort_order', 0)),
+        'manual_sort_order': normalize_account_sort_order(account.get('manual_sort_order', 0)),
         'remark': account.get('remark', ''),
         'status': account.get('status', 'active'),
         'account_type': account.get('account_type', 'outlook'),
@@ -1469,6 +1507,15 @@ def serialize_account_summary(account: Dict[str, Any], last_refresh_log: Optiona
         'last_refresh_at': refresh_state['last_refresh_at'],
         'last_refresh_success_at': account.get('last_refresh_success_at'),
         'refresh_token_updated_at': account.get('refresh_token_updated_at'),
+        'refresh_token_expires_at': account.get('refresh_token_expires_at'),
+        'refresh_token_warning': get_refresh_token_rotation_warning(
+            account.get('refresh_token_expires_at'),
+            warning_window_days=get_refresh_token_expiry_window_days(),
+        ) if (
+            str(account.get('account_type') or 'outlook').strip().lower() == 'outlook'
+            and str(account.get('client_id') or '').strip()
+            and str(account.get('refresh_token') or '').strip()
+        ) else '',
         'last_refresh_status': refresh_state['last_refresh_status'],
         'last_refresh_error': refresh_state['last_refresh_error'],
         'last_refresh_token_rotated': (
@@ -1493,9 +1540,10 @@ ACCOUNT_INSERT_SQL = '''
     INSERT OR IGNORE INTO accounts (
         email, password, client_id, refresh_token, group_id, sort_order, remark,
         status, account_type, provider, graph_token_scope, imap_host, imap_port, imap_password, forward_enabled,
-        forward_last_checked_at, proxy_url, fallback_proxy_url_1, fallback_proxy_url_2
+        forward_last_checked_at, proxy_url, fallback_proxy_url_1, fallback_proxy_url_2,
+        refresh_token_updated_at, refresh_token_expires_at
     )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 '''
 
 
@@ -1516,6 +1564,15 @@ def build_account_insert_values(email_addr: str, password: str, client_id: str =
     normalized_imap_port = int(imap_port or provider_meta.get('imap_port', 993) or 993)
     normalized_sort_order = parse_account_sort_order_input(sort_order)
     normalized_status = normalize_account_status(status)
+    refresh_token_anchor_updated_at = None
+    refresh_token_anchor_expires_at = None
+    if normalized_account_type == 'outlook' and client_id and refresh_token:
+        anchor_now = datetime.now(timezone(timedelta(hours=8)))
+        refresh_token_anchor_updated_at = anchor_now.isoformat(timespec='seconds')
+        refresh_token_anchor_expires_at = build_refresh_token_expiry(
+            default_lifetime_days=get_refresh_token_default_lifetime_days(),
+            now=anchor_now,
+        )
 
     return (
         email_addr,
@@ -1537,6 +1594,8 @@ def build_account_insert_values(email_addr: str, password: str, client_id: str =
         str(proxy_url or '').strip(),
         str(fallback_proxy_url_1 or '').strip(),
         str(fallback_proxy_url_2 or '').strip(),
+        refresh_token_anchor_updated_at,
+        refresh_token_anchor_expires_at,
     )
 
 
@@ -2147,9 +2206,15 @@ def update_account(account_id: int, email_addr: str, password: str, client_id: s
         )
 
         current_account = db.execute(
-            'SELECT forward_enabled, forward_last_checked_at, account_type, authorization_type FROM accounts WHERE id = ?',
+            'SELECT forward_enabled, forward_last_checked_at, account_type, authorization_type, refresh_token '
+            'FROM accounts WHERE id = ?',
             (account_id,)
         ).fetchone()
+        try:
+            existing_refresh_token = decrypt_data(current_account['refresh_token']) if current_account and current_account['refresh_token'] else ''
+        except Exception:
+            existing_refresh_token = str(current_account['refresh_token'] or '') if current_account else ''
+        refresh_token_changed = refresh_token != existing_refresh_token
         effective_authorization_type = (
             get_account_authorization_type(current_account)
             if authorization_type is None and current_account
@@ -2198,6 +2263,25 @@ def update_account(account_id: int, email_addr: str, password: str, client_id: s
                 imap_host, imap_port, encrypted_imap_password, 1 if forward_enabled else 0,
                 normalized_proxy_url, normalized_fallback_proxy_url_1, normalized_fallback_proxy_url_2, account_id
             ))
+        if refresh_token_changed:
+            if str(account_type or '').strip().lower() == 'outlook' and client_id and refresh_token:
+                anchor_now = datetime.now(timezone(timedelta(hours=8)))
+                anchor_updated_at = anchor_now.isoformat(timespec='seconds')
+                anchor_expires_at = build_refresh_token_expiry(
+                    default_lifetime_days=get_refresh_token_default_lifetime_days(),
+                    now=anchor_now,
+                )
+            else:
+                anchor_updated_at = None
+                anchor_expires_at = None
+            db.execute(
+                '''
+                UPDATE accounts
+                SET refresh_token_updated_at = ?, refresh_token_expires_at = ?
+                WHERE id = ?
+                ''',
+                (anchor_updated_at, anchor_expires_at, account_id),
+            )
         db.commit()
         if normalized_graph_token_scope is not None:
             register_graph_token_scope_preference(client_id, refresh_token, normalized_graph_token_scope)
